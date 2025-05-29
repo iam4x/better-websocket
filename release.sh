@@ -34,7 +34,7 @@ bun run build
 
 # Publish to npm
 echo "Publishing to npm..."
-npm publish
+npm publish --access public
 
 # Commit and push changes
 echo "Committing changes..."
