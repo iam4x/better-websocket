@@ -70,6 +70,12 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
   private isDestroyed: boolean = false;
   private shouldReconnect: boolean = true;
 
+  // Bound event handlers for proper cleanup
+  private boundHandleOpen = this.handleOpen.bind(this);
+  private boundHandleMessage = this.handleMessage.bind(this);
+  private boundHandleClose = this.handleClose.bind(this);
+  private boundHandleSocketError = this.handleSocketError.bind(this);
+
   constructor(
     urls: string | string[],
     protocols?: string | string[],
@@ -130,6 +136,8 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
     this.url = currentUrl;
 
     try {
+      this.disconnectSocket();
+
       this.socket = new WebSocket(currentUrl, this.options.protocols);
       this.setupSocketListeners();
       this.startConnectTimeout();
@@ -138,13 +146,33 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
     }
   }
 
+  private disconnectSocket(): void {
+    if (this.socket) {
+      // Remove event listeners to prevent memory leaks
+      this.socket.removeEventListener("open", this.boundHandleOpen);
+      this.socket.removeEventListener("message", this.boundHandleMessage);
+      this.socket.removeEventListener("close", this.boundHandleClose);
+      this.socket.removeEventListener("error", this.boundHandleSocketError);
+
+      // Close the socket if still open
+      if (
+        this.socket.readyState === WebSocket.OPEN ||
+        this.socket.readyState === WebSocket.CONNECTING
+      ) {
+        this.socket.close();
+      }
+
+      this.socket = null;
+    }
+  }
+
   private setupSocketListeners(): void {
     if (!this.socket) return;
 
-    this.socket.addEventListener("open", this.handleOpen.bind(this));
-    this.socket.addEventListener("message", this.handleMessage.bind(this));
-    this.socket.addEventListener("close", this.handleClose.bind(this));
-    this.socket.addEventListener("error", this.handleSocketError.bind(this));
+    this.socket.addEventListener("open", this.boundHandleOpen);
+    this.socket.addEventListener("message", this.boundHandleMessage);
+    this.socket.addEventListener("close", this.boundHandleClose);
+    this.socket.addEventListener("error", this.boundHandleSocketError);
   }
 
   private handleOpen(_event: Event): void {
@@ -296,9 +324,27 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
         this.send(this.options.heartbeatMessage);
 
         // Set a timeout to close connection if no response received
-        this.resetHeartbeatTimeout();
+        // Only set the timeout if heartbeat is enabled (prevent redundant timeout)
+        this.setHeartbeatTimeout();
       }
     }, this.options.heartbeatInterval);
+  }
+
+  private setHeartbeatTimeout(): void {
+    if (!this.options.enableHeartbeat) {
+      return;
+    }
+
+    if (this.heartbeatTimeoutId) {
+      clearTimeout(this.heartbeatTimeoutId);
+    }
+
+    this.heartbeatTimeoutId = setTimeout(() => {
+      if (this.readyState === BetterWebSocketState.OPEN && !this.isDestroyed) {
+        // Heartbeat response timeout, reconnecting
+        this.close(1000, "Heartbeat response timeout");
+      }
+    }, this.options.heartbeatTimeout);
   }
 
   private resetHeartbeatTimeout(): void {
@@ -308,15 +354,7 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
 
     // Only set heartbeat timeout if heartbeat is enabled
     if (this.options.enableHeartbeat) {
-      this.heartbeatTimeoutId = setTimeout(() => {
-        if (
-          this.readyState === BetterWebSocketState.OPEN &&
-          !this.isDestroyed
-        ) {
-          // Heartbeat response timeout, reconnecting
-          this.close(1000, "Heartbeat response timeout");
-        }
-      }, this.options.heartbeatTimeout);
+      this.setHeartbeatTimeout();
     }
   }
 
@@ -389,6 +427,10 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
   }
 
   private closeInternal(code?: number, reason?: string): void {
+    if (this.readyState === BetterWebSocketState.CLOSED) {
+      return; // Already closed
+    }
+
     this.readyState = BetterWebSocketState.CLOSING;
     this.clearTimeouts();
 
@@ -396,13 +438,14 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
       this.socket.close(code, reason);
     } else {
       // If no socket exists, immediately transition to closed
+      this.readyState = BetterWebSocketState.CLOSED;
+      const closeEvent = new CloseEvent("close", {
+        code: code || 1000,
+        reason: reason || "",
+        wasClean: true,
+      });
+
       setTimeout(() => {
-        this.readyState = BetterWebSocketState.CLOSED;
-        const closeEvent = new CloseEvent("close", {
-          code: code || 1000,
-          reason: reason || "",
-          wasClean: true,
-        });
         this.dispatchEvent(closeEvent);
         if (this.onclose) {
           this.onclose.call(this, closeEvent);
@@ -412,20 +455,30 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
   }
 
   public close(code?: number, reason?: string): void {
+    if (
+      this.readyState === BetterWebSocketState.CLOSED ||
+      this.readyState === BetterWebSocketState.CLOSING
+    ) {
+      return; // Already closing or closed
+    }
     this.shouldReconnect = false;
     this.closeInternal(code, reason);
   }
 
   public destroy(): void {
+    if (this.isDestroyed) {
+      return; // Already destroyed
+    }
+
     this.isDestroyed = true;
     this.shouldReconnect = false;
     this.clearTimeouts();
     this.messageQueue = [];
     this.bufferedAmount = 0;
 
-    if (this.socket && this.readyState !== BetterWebSocketState.CLOSED) {
-      this.closeInternal();
-    } else if (this.readyState !== BetterWebSocketState.CLOSED) {
+    this.disconnectSocket();
+
+    if (this.readyState !== BetterWebSocketState.CLOSED) {
       this.readyState = BetterWebSocketState.CLOSED;
     }
   }
@@ -449,10 +502,14 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
   }
 
   public forceReconnect(): void {
+    if (this.isDestroyed) {
+      return; // Don't reconnect if destroyed
+    }
+
     this.shouldReconnect = true;
     if (this.socket && this.readyState === BetterWebSocketState.OPEN) {
       this.closeInternal(1000, "Force reconnect");
-    } else {
+    } else if (this.readyState === BetterWebSocketState.CLOSED) {
       this.connect();
     }
   }
