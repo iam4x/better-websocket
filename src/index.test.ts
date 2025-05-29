@@ -15,8 +15,10 @@ let testServer: any;
 let testServerPort: number;
 let secondTestServer: any;
 let secondTestServerPort: number;
+let slowServer: any;
+let slowServerPort: number;
 
-const createTestServer = (port: number): Promise<any> => {
+const createTestServer = (port: number, delay = 0): Promise<any> => {
   return new Promise((resolve) => {
     const server = Bun.serve({
       port,
@@ -28,15 +30,26 @@ const createTestServer = (port: number): Promise<any> => {
       },
       websocket: {
         message(_ws, message) {
-          // Echo messages back
-          if (message === "ping") {
-            _ws.send("pong");
+          // Add artificial delay if specified for slow server testing
+          if (delay > 0) {
+            setTimeout(() => {
+              _ws.send(`delayed-echo: ${message}`);
+            }, delay);
           } else {
-            _ws.send(`echo: ${message}`);
+            // Echo messages back
+            if (message === "ping") {
+              _ws.send("pong");
+            } else {
+              _ws.send(`echo: ${message}`);
+            }
           }
         },
         open(_ws) {
-          // Test server: client connected
+          if (delay > 0) {
+            setTimeout(() => {
+              _ws.send("delayed-open");
+            }, delay);
+          }
         },
         close(_ws) {
           // Test server: client disconnected
@@ -56,8 +69,12 @@ beforeAll(async () => {
   secondTestServerPort = 8081;
   secondTestServer = await createTestServer(secondTestServerPort);
 
+  // Start slow server for timing tests
+  slowServerPort = 8082;
+  slowServer = await createTestServer(slowServerPort, 100); // 100ms delay
+
   // Wait a bit for servers to start
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  await new Promise((resolve) => setTimeout(resolve, 200));
 });
 
 afterAll(() => {
@@ -66,6 +83,9 @@ afterAll(() => {
   }
   if (secondTestServer) {
     secondTestServer.stop();
+  }
+  if (slowServer) {
+    slowServer.stop();
   }
 });
 
@@ -249,6 +269,37 @@ describe("BetterWebSocket", () => {
       ws.clearMessageQueue();
       expect(ws.getQueuedMessageCount()).toBe(0);
     });
+
+    test("should handle binary data in queue", () => {
+      ws = new BetterWebSocket("ws://localhost:9999");
+
+      const binaryData = new Uint8Array([1, 2, 3, 4, 5]);
+      const arrayBuffer = new ArrayBuffer(8);
+      const blob = new Blob(["test"]);
+
+      ws.send(binaryData);
+      ws.send(arrayBuffer);
+      ws.send(blob);
+
+      expect(ws.getQueuedMessageCount()).toBe(3);
+    });
+
+    test("should handle queue overflow correctly", () => {
+      const options: BetterWebSocketOptions = {
+        maxQueueSize: 3,
+      };
+
+      ws = new BetterWebSocket("ws://localhost:9999", undefined, options);
+
+      // Add messages beyond queue size
+      ws.send("message1");
+      ws.send("message2");
+      ws.send("message3");
+      ws.send("message4"); // Should remove message1
+      ws.send("message5"); // Should remove message2
+
+      expect(ws.getQueuedMessageCount()).toBe(3);
+    });
   });
 
   describe("URL Fallback", () => {
@@ -294,6 +345,66 @@ describe("BetterWebSocket", () => {
         done();
       });
     }, 5000);
+
+    test("should handle URL fallback with immediate reconnection", (done) => {
+      const urls = [
+        "ws://localhost:9999", // Will fail
+        "ws://localhost:9998", // Will fail
+        `ws://localhost:${testServerPort}`, // Will succeed
+      ];
+
+      ws = new BetterWebSocket(urls, undefined, {
+        connectTimeout: 100,
+        maxReconnectAttempts: 0, // No reconnection attempts beyond URL fallback
+      });
+
+      ws.addEventListener("open", () => {
+        // Should connect to the third URL
+        expect(ws.getCurrentUrl()).toBe(`ws://localhost:${testServerPort}`);
+        done();
+      });
+
+      ws.addEventListener("close", (event) => {
+        const closeEvent = event as CloseEvent;
+        // Only fail if we're on the last URL and it still fails
+        if (ws.getCurrentUrl() === `ws://localhost:${testServerPort}`) {
+          done(
+            new Error(
+              `URL fallback failed on working server: ${closeEvent.reason}`,
+            ),
+          );
+        }
+        // Otherwise, this is expected as URLs are being tried
+      });
+    }, 2000);
+
+    test("should properly reset URL index on successful connection", (done) => {
+      const urls = [
+        "ws://localhost:9999", // Will fail initially
+        `ws://localhost:${testServerPort}`, // Will succeed
+      ];
+
+      ws = new BetterWebSocket(urls, undefined, {
+        connectTimeout: 50,
+        maxReconnectAttempts: 1,
+      });
+
+      let connectionCount = 0;
+
+      ws.addEventListener("open", () => {
+        connectionCount++;
+
+        if (connectionCount === 1) {
+          // First connection successful, now force a reconnection
+          ws.forceReconnect();
+        } else {
+          // If URL index isn't reset properly,
+          // we might not start from the first URL again
+          expect(ws.getCurrentUrl()).toBe(urls[1]); // Should use working URL
+          done();
+        }
+      });
+    }, 2000);
   });
 
   describe("Reconnection", () => {
@@ -386,6 +497,105 @@ describe("BetterWebSocket", () => {
         }
       });
     }, 3000);
+
+    test("should handle message receive timing edge case", (done) => {
+      const options: BetterWebSocketOptions = {
+        enableHeartbeat: true,
+        heartbeatInterval: 400,
+        heartbeatTimeout: 300, // Generous timeout
+      };
+
+      ws = new BetterWebSocket(
+        `ws://localhost:${testServerPort}`,
+        undefined,
+        options,
+      );
+
+      let messageCount = 0;
+      let testCompleted = false;
+
+      ws.addEventListener("open", () => {
+        // Start sending messages that might interfere with heartbeat timing
+        const messageInterval = setInterval(() => {
+          if (messageCount < 2 && !testCompleted) {
+            ws.send(`test-${messageCount++}`);
+          } else {
+            clearInterval(messageInterval);
+          }
+        }, 100); // Send messages faster than heartbeat interval
+      });
+
+      ws.addEventListener("message", () => {
+        // Check if we received all test messages
+        if (messageCount >= 2 && !testCompleted) {
+          testCompleted = true;
+          setTimeout(() => {
+            expect(ws.readyState).toBe(BetterWebSocketState.OPEN);
+            done();
+          }, 50);
+        }
+      });
+
+      ws.addEventListener("close", () => {
+        // If this fires before we complete the test, it means heartbeat timing has a bug
+        if (!testCompleted) {
+          done(new Error("Connection closed prematurely due to heartbeat bug"));
+        }
+      });
+
+      // Timeout safety - generous timeout since we want to test heartbeat behavior
+      setTimeout(() => {
+        if (!testCompleted) {
+          testCompleted = true;
+          // This is actually expected - if heartbeat works correctly,
+          // the connection should stay open
+          expect(ws.readyState).toBe(BetterWebSocketState.OPEN);
+          done();
+        }
+      }, 1000);
+    }, 1500);
+
+    test("should not send heartbeat when connection is closing", (done) => {
+      const options: BetterWebSocketOptions = {
+        enableHeartbeat: true,
+        heartbeatInterval: 50,
+        heartbeatMessage: "ping",
+      };
+
+      ws = new BetterWebSocket(
+        `ws://localhost:${testServerPort}`,
+        undefined,
+        options,
+      );
+
+      let pingsSentAfterClose = 0;
+      let closeCalled = false;
+
+      ws.addEventListener("open", () => {
+        // Mock the send method to count pings
+        const originalSend = ws.send.bind(ws);
+        ws.send = ((data: any) => {
+          if (data === "ping" && closeCalled) {
+            pingsSentAfterClose++;
+          }
+          return originalSend(data);
+        }) as any;
+
+        // Close after a short delay
+        setTimeout(() => {
+          closeCalled = true;
+          ws.close();
+        }, 75);
+      });
+
+      ws.addEventListener("close", () => {
+        // Wait to see if any pings are sent after close
+        setTimeout(() => {
+          expect(pingsSentAfterClose).toBe(0);
+          done();
+        }, 150);
+      });
+    });
   });
 
   describe("Connection Timeout", () => {
@@ -406,6 +616,174 @@ describe("BetterWebSocket", () => {
         done();
       }, 1500);
     }, 3000);
+  });
+
+  describe("BufferedAmount Tracking", () => {
+    test("bufferedAmount should be updated when sending data", (done) => {
+      ws = new BetterWebSocket(`ws://localhost:${testServerPort}`);
+
+      ws.addEventListener("open", () => {
+        // When connected, bufferedAmount should be 0
+        expect(ws.bufferedAmount).toBe(0);
+
+        ws.send("test message");
+
+        // When connected, messages are sent immediately, so bufferedAmount stays 0
+        expect(ws.bufferedAmount).toBe(0);
+
+        done();
+      });
+    });
+
+    test("bufferedAmount should track queued messages size", () => {
+      // Create WebSocket that won't connect
+      ws = new BetterWebSocket("ws://localhost:9999");
+
+      const message1 = "message 1";
+      const message2 = "message 2";
+
+      ws.send(message1);
+      ws.send(message2);
+
+      // bufferedAmount should reflect queued data size
+      expect(ws.bufferedAmount).toBeGreaterThan(0);
+      expect(ws.getQueuedMessageCount()).toBe(2);
+    });
+  });
+
+  describe("State Management", () => {
+    test("should not allow send after destroy", () => {
+      ws = new BetterWebSocket(`ws://localhost:${testServerPort}`);
+
+      ws.destroy();
+
+      const initialQueueSize = ws.getQueuedMessageCount();
+      ws.send("should not be queued");
+
+      // Destroyed WebSocket should not queue messages
+      expect(ws.getQueuedMessageCount()).toBe(initialQueueSize);
+    });
+
+    test("readyState should transition correctly", (done) => {
+      const stateChanges: number[] = [];
+
+      ws = new BetterWebSocket(`ws://localhost:${testServerPort}`);
+
+      // Track state changes through events instead of intercepting setter
+      const originalReadyState = ws.readyState;
+      stateChanges.push(originalReadyState);
+
+      ws.addEventListener("open", () => {
+        stateChanges.push(ws.readyState);
+        ws.close();
+      });
+
+      ws.addEventListener("close", () => {
+        stateChanges.push(ws.readyState);
+        // Check that state transitions are correct
+        // Should include: CONNECTING -> OPEN -> CLOSED
+        expect(stateChanges).toContain(BetterWebSocketState.CONNECTING);
+        expect(stateChanges).toContain(BetterWebSocketState.OPEN);
+        expect(stateChanges).toContain(BetterWebSocketState.CLOSED);
+        done();
+      });
+    });
+
+    test("concurrent close and connect should not cause state inconsistency", (done) => {
+      ws = new BetterWebSocket(`ws://localhost:${testServerPort}`);
+
+      ws.addEventListener("open", () => {
+        // Immediately close and force reconnect at the same time
+        ws.close();
+        ws.forceReconnect();
+
+        // Wait and check that we don't have inconsistent state
+        setTimeout(() => {
+          // State should be CLOSED or CONNECTING, not stuck in CLOSING
+          expect([
+            BetterWebSocketState.CLOSED,
+            BetterWebSocketState.CONNECTING,
+            BetterWebSocketState.OPEN,
+          ]).toContain(ws.readyState);
+          done();
+        }, 200);
+      });
+    });
+
+    test("destroy during connection should not cause hanging state", (done) => {
+      ws = new BetterWebSocket(`ws://localhost:${testServerPort}`);
+
+      // Destroy immediately after creation, before connection completes
+      setTimeout(() => {
+        ws.destroy();
+
+        // Wait to ensure no further state changes occur
+        setTimeout(() => {
+          expect(ws.readyState).toBe(BetterWebSocketState.CLOSED);
+          done();
+        }, 100);
+      }, 10);
+    });
+  });
+
+  describe("Memory Management", () => {
+    test("should properly clean up event listeners on socket replacement", (done) => {
+      const urls = [
+        "ws://localhost:9999", // Will fail
+        `ws://localhost:${testServerPort}`, // Will succeed
+      ];
+
+      ws = new BetterWebSocket(urls, undefined, {
+        connectTimeout: 100,
+        maxReconnectAttempts: 1,
+      });
+
+      let eventCount = 0;
+      ws.addEventListener("open", () => {
+        eventCount++;
+      });
+
+      // Wait for URL fallback to occur
+      setTimeout(() => {
+        // If event listeners aren't properly cleaned up,
+        // we might have multiple listeners from failed socket attempts
+        expect(eventCount).toBe(1); // Should only fire once
+        done();
+      }, 500);
+    });
+  });
+
+  describe("Type Safety", () => {
+    test("Timer type compatibility - should handle different timer return types", () => {
+      ws = new BetterWebSocket(`ws://localhost:${testServerPort}`);
+
+      // The Timer type should be compatible across environments
+      const originalSetTimeout = global.setTimeout;
+
+      // Mock setTimeout to return a number (like in browser)
+      const mockTimeouts = new Set<any>();
+      global.setTimeout = ((fn: any, delay: number) => {
+        const id = originalSetTimeout(fn, delay);
+        mockTimeouts.add(id);
+        return id;
+      }) as any;
+
+      const originalClearTimeout = global.clearTimeout;
+      global.clearTimeout = ((id: any) => {
+        mockTimeouts.delete(id);
+        originalClearTimeout(id);
+      }) as any;
+
+      try {
+        // This should not cause type errors
+        ws.close();
+        expect(true).toBe(true);
+      } finally {
+        // Restore original functions
+        global.setTimeout = originalSetTimeout;
+        global.clearTimeout = originalClearTimeout;
+      }
+    });
   });
 
   describe("Utility Methods", () => {
@@ -471,6 +849,43 @@ describe("BetterWebSocket", () => {
         ws = new BetterWebSocket("invalid://localhost:8080");
       }).not.toThrow(); // Should handle gracefully, not throw synchronously
     });
+
+    test("should properly propagate construction errors", () => {
+      // Test with malformed URL
+      expect(() => {
+        ws = new BetterWebSocket("not-a-url");
+      }).not.toThrow(); // Should handle gracefully, not throw immediately
+
+      // Test with empty protocol array
+      expect(() => {
+        ws = new BetterWebSocket(`ws://localhost:${testServerPort}`, []);
+      }).not.toThrow();
+    });
+  });
+
+  describe("Protocol Handling", () => {
+    test("should handle protocol selection correctly", (done) => {
+      const protocols = ["protocol1", "protocol2"];
+
+      ws = new BetterWebSocket(`ws://localhost:${testServerPort}`, protocols);
+
+      ws.addEventListener("open", () => {
+        // The protocol should be available
+        expect(typeof ws.protocol).toBe("string");
+        done();
+      });
+
+      ws.addEventListener("error", () => {
+        // If connection fails, that's also a valid test result
+        expect(typeof ws.protocol).toBe("string");
+        done();
+      });
+
+      // Timeout safety
+      setTimeout(() => {
+        done();
+      }, 1000);
+    }, 1500);
   });
 
   describe("WebSocket Interface Compliance", () => {

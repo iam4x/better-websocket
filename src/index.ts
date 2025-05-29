@@ -32,6 +32,7 @@ export enum BetterWebSocketState {
 export interface QueuedMessage {
   data: string | ArrayBufferLike | Blob | ArrayBufferView;
   timestamp: number;
+  size: number;
 }
 
 export class BetterWebSocket extends EventTarget implements WebSocket {
@@ -62,11 +63,10 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
   private socket: WebSocket | null = null;
   private messageQueue: QueuedMessage[] = [];
   private reconnectAttempts: number = 0;
-  private reconnectTimeoutId: Timer | null = null;
-  private connectTimeoutId: Timer | null = null;
-  private heartbeatIntervalId: Timer | null = null;
-  private heartbeatTimeoutId: Timer | null = null;
-  private lastMessageReceived: number = Date.now();
+  private reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null;
+  private connectTimeoutId: ReturnType<typeof setTimeout> | null = null;
+  private heartbeatIntervalId: ReturnType<typeof setInterval> | null = null;
+  private heartbeatTimeoutId: ReturnType<typeof setTimeout> | null = null;
   private isDestroyed: boolean = false;
   private shouldReconnect: boolean = true;
 
@@ -96,6 +96,28 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
 
     this.url = this.urls[0];
     this.connect();
+  }
+
+  private calculateDataSize(
+    data: string | ArrayBufferLike | Blob | ArrayBufferView,
+  ): number {
+    if (typeof data === "string") {
+      return new TextEncoder().encode(data).length;
+    } else if (data instanceof Blob) {
+      return data.size;
+    } else if (data instanceof ArrayBuffer) {
+      return data.byteLength;
+    } else if (ArrayBuffer.isView(data)) {
+      return data.byteLength;
+    }
+    return 0;
+  }
+
+  private updateBufferedAmount(): void {
+    this.bufferedAmount = this.messageQueue.reduce(
+      (total, msg) => total + msg.size,
+      0,
+    );
   }
 
   private connect(): void {
@@ -129,7 +151,6 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
     this.clearTimeouts();
     this.readyState = BetterWebSocketState.OPEN;
     this.reconnectAttempts = 0;
-    this.lastMessageReceived = Date.now();
 
     // Copy socket properties
     if (this.socket) {
@@ -154,8 +175,6 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
   }
 
   private handleMessage(event: MessageEvent): void {
-    this.lastMessageReceived = Date.now();
-
     // Reset heartbeat timeout
     if (this.options.enableHeartbeat) {
       this.resetHeartbeatTimeout();
@@ -222,12 +241,17 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
     if (this.onclose) {
       this.onclose.call(this, closeEvent);
     }
+
+    // Trigger reconnection immediately for URL fallback
+    if (this.shouldReconnect && !this.isDestroyed) {
+      this.attemptReconnect();
+    }
   }
 
   private attemptReconnect(): void {
     if (this.isDestroyed || !this.shouldReconnect) return;
 
-    // Try next URL if available
+    // Try next URL if available (URL fallback doesn't count as reconnection attempt)
     if (this.currentUrlIndex < this.urls.length - 1) {
       this.currentUrlIndex++;
       // Update the current URL
@@ -236,7 +260,7 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
       return;
     }
 
-    // Reset to first URL and check reconnect attempts
+    // All URLs tried, now we start counting reconnection attempts
     this.currentUrlIndex = 0;
     this.url = this.urls[0];
 
@@ -267,20 +291,11 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
 
   private startHeartbeat(): void {
     this.heartbeatIntervalId = setInterval(() => {
-      if (this.readyState === BetterWebSocketState.OPEN) {
-        // Check if we haven't received a message in too long
-        const timeSinceLastMessage = Date.now() - this.lastMessageReceived;
-        if (
-          timeSinceLastMessage >
-          this.options.heartbeatInterval + this.options.heartbeatTimeout
-        ) {
-          // Heartbeat timeout, reconnecting
-          this.close(1000, "Heartbeat timeout");
-          return;
-        }
-
+      if (this.readyState === BetterWebSocketState.OPEN && !this.isDestroyed) {
         // Send heartbeat
         this.send(this.options.heartbeatMessage);
+
+        // Set a timeout to close connection if no response received
         this.resetHeartbeatTimeout();
       }
     }, this.options.heartbeatInterval);
@@ -291,12 +306,18 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
       clearTimeout(this.heartbeatTimeoutId);
     }
 
-    this.heartbeatTimeoutId = setTimeout(() => {
-      if (this.readyState === BetterWebSocketState.OPEN) {
-        // Heartbeat response timeout, reconnecting
-        this.close(1000, "Heartbeat response timeout");
-      }
-    }, this.options.heartbeatTimeout);
+    // Only set heartbeat timeout if heartbeat is enabled
+    if (this.options.enableHeartbeat) {
+      this.heartbeatTimeoutId = setTimeout(() => {
+        if (
+          this.readyState === BetterWebSocketState.OPEN &&
+          !this.isDestroyed
+        ) {
+          // Heartbeat response timeout, reconnecting
+          this.close(1000, "Heartbeat response timeout");
+        }
+      }, this.options.heartbeatTimeout);
+    }
   }
 
   private flushMessageQueue(): void {
@@ -307,6 +328,7 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
       const message = this.messageQueue.shift()!;
       this.sendDirectly(message.data);
     }
+    this.updateBufferedAmount();
   }
 
   private clearTimeouts(): void {
@@ -341,10 +363,17 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
 
   // Public WebSocket interface methods
   public send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void {
+    if (this.isDestroyed) {
+      // Don't queue or send messages after destroy
+      return;
+    }
+
     if (this.readyState === BetterWebSocketState.OPEN) {
       this.sendDirectly(data);
     } else {
       // Queue message for later sending
+      const size = this.calculateDataSize(data);
+
       if (this.messageQueue.length >= this.options.maxQueueSize) {
         this.messageQueue.shift(); // Remove oldest message
       }
@@ -352,7 +381,10 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
       this.messageQueue.push({
         data,
         timestamp: Date.now(),
+        size,
       });
+
+      this.updateBufferedAmount();
     }
   }
 
@@ -387,9 +419,15 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
   public destroy(): void {
     this.isDestroyed = true;
     this.shouldReconnect = false;
-    this.close();
     this.clearTimeouts();
     this.messageQueue = [];
+    this.bufferedAmount = 0;
+
+    if (this.socket && this.readyState !== BetterWebSocketState.CLOSED) {
+      this.closeInternal();
+    } else if (this.readyState !== BetterWebSocketState.CLOSED) {
+      this.readyState = BetterWebSocketState.CLOSED;
+    }
   }
 
   // Additional utility methods
@@ -399,6 +437,7 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
 
   public clearMessageQueue(): void {
     this.messageQueue = [];
+    this.updateBufferedAmount();
   }
 
   public getCurrentUrl(): string {
