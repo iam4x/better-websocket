@@ -1,3 +1,5 @@
+import { RingBufferQueue } from "./queue";
+
 export interface BetterWebSocketOptions {
   connectTimeout?: number;
   maxReconnectAttempts?: number;
@@ -7,6 +9,7 @@ export interface BetterWebSocketOptions {
   enableHeartbeat?: boolean;
   heartbeatMessage?: string;
   maxQueueSize?: number;
+  maxQueueBytes?: number;
   protocols?: string | string[];
 }
 
@@ -19,6 +22,7 @@ interface ResolvedBetterWebSocketOptions {
   enableHeartbeat: boolean;
   heartbeatMessage: string;
   maxQueueSize: number;
+  maxQueueBytes: number;
   protocols: string | string[] | undefined;
 }
 
@@ -61,7 +65,7 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
   private currentUrlIndex: number = 0;
   private options: ResolvedBetterWebSocketOptions;
   private socket: WebSocket | null = null;
-  private messageQueue: QueuedMessage[] = [];
+  private messageQueue: RingBufferQueue<QueuedMessage>;
   private reconnectAttempts: number = 0;
   private reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null;
   private connectTimeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -97,8 +101,14 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
       enableHeartbeat: options.enableHeartbeat ?? false,
       heartbeatMessage: options.heartbeatMessage ?? "ping",
       maxQueueSize: options.maxQueueSize ?? 100,
+      maxQueueBytes: options.maxQueueBytes ?? 1024 * 1024,
       protocols: protocols || options.protocols || undefined,
     };
+
+    this.messageQueue = new RingBufferQueue<QueuedMessage>(
+      this.options.maxQueueSize,
+      this.options.maxQueueBytes,
+    );
 
     this.url = this.urls[0];
     this.connect();
@@ -120,10 +130,7 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
   }
 
   private updateBufferedAmount(): void {
-    this.bufferedAmount = this.messageQueue.reduce(
-      (total, msg) => total + msg.size,
-      0,
-    );
+    this.bufferedAmount = this.messageQueue.byteSize;
   }
 
   private connect(): void {
@@ -409,19 +416,13 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
     if (this.readyState === BetterWebSocketState.OPEN) {
       this.sendDirectly(data);
     } else {
-      // Queue message for later sending
       const size = this.calculateDataSize(data);
-
-      if (this.messageQueue.length >= this.options.maxQueueSize) {
-        this.messageQueue.shift(); // Remove oldest message
-      }
-
-      this.messageQueue.push({
+      const message: QueuedMessage = {
         data,
         timestamp: Date.now(),
         size,
-      });
-
+      };
+      this.messageQueue.push(message);
       this.updateBufferedAmount();
     }
   }
@@ -473,7 +474,7 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
     this.isDestroyed = true;
     this.shouldReconnect = false;
     this.clearTimeouts();
-    this.messageQueue = [];
+    this.messageQueue.clear();
     this.bufferedAmount = 0;
 
     this.disconnectSocket();
@@ -489,7 +490,7 @@ export class BetterWebSocket extends EventTarget implements WebSocket {
   }
 
   public clearMessageQueue(): void {
-    this.messageQueue = [];
+    this.messageQueue.clear();
     this.updateBufferedAmount();
   }
 

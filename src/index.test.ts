@@ -300,6 +300,33 @@ describe("BetterWebSocket", () => {
 
       expect(ws.getQueuedMessageCount()).toBe(3);
     });
+
+    test("should respect max queue byte size", () => {
+      const options: BetterWebSocketOptions = {
+        maxQueueSize: 10,
+        maxQueueBytes: 10,
+      };
+
+      ws = new BetterWebSocket(`ws://localhost:9999`, undefined, options);
+
+      ws.send("1234");
+      ws.send("5678");
+      ws.send("90ab"); // total 12 bytes, should drop the first
+
+      expect(ws.getQueuedMessageCount()).toBe(2);
+      expect(ws.bufferedAmount).toBeLessThanOrEqual(10);
+    });
+
+    test("should error when single message exceeds byte size limit", () => {
+      const options: BetterWebSocketOptions = {
+        maxQueueSize: 2,
+        maxQueueBytes: 5,
+      };
+
+      ws = new BetterWebSocket(`ws://localhost:9999`, undefined, options);
+
+      expect(() => ws.send("toolong")).toThrow();
+    });
   });
 
   describe("URL Fallback", () => {
