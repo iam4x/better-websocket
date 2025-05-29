@@ -1,0 +1,9 @@
+echo "Running pre-commit hook..."
+
+# Run lint
+echo "Running lint..."
+bun run lint
+
+# Run tests
+echo "Running tests..."
+bun run test
